@@ -1,0 +1,48 @@
+#include "common/Ranges.h"
+#include "common/endianlove.h"
+#include "common/io/FileWriter.h"
+#include "fileformats/mngfile.h"
+
+#include <fmt/format.h>
+#include <filesystem>
+#include <utility>
+
+namespace fs = std::filesystem;
+
+int main(int argc, char** argv) {
+	if (argc != 2) {
+		fmt::print(stderr, "syntax: mngdumper filename\n");
+		exit(1);
+	}
+
+	fs::path input_path(argv[1]);
+	if (!fs::exists(input_path)) {
+		fmt::print(stderr, "File {:?} doesn't exist\n", input_path.string());
+		exit(1);
+	}
+
+	fs::path stem = input_path.stem();
+	fs::path output_directory = stem;
+
+	if (!fs::create_directories(output_directory)) {
+		if (!fs::is_directory(output_directory)) {
+			fmt::print(stderr, "Couldn't create output directory {:?}\n", output_directory.string());
+			exit(1);
+		}
+	}
+
+	MNGFile file(argv[1]);
+
+	fs::path script_filename((output_directory / stem).string() + ".txt");
+	fmt::print("{}\n", script_filename.string());
+	FileWriter script(script_filename);
+	script.write(file.script.c_str(), file.script.size());
+
+	for (auto kv : zip(file.getSampleNames(), file.samples)) {
+		fs::path sample_filename((output_directory / kv.first).string() + ".wav");
+		fmt::print("{}\n", sample_filename.string());
+
+		FileWriter out((output_directory / kv.first).string() + ".wav");
+		out.write((const char*)kv.second.data(), kv.second.size());
+	}
+}

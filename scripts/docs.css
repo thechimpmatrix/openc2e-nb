@@ -1,0 +1,117 @@
+body {
+    font-family: sans-serif;
+}
+
+#index li {
+    /* try to fit it all in one line */
+    display: inline;
+}
+
+#sidebar {
+    float: left;
+    clear: left;
+    font-size: x-small;
+    border: 1px #a2a9b1 solid;
+    width: 10em;
+    background: #f6f6f6;
+}
+
+#sidebar ul {
+    padding-left: 2.5em;
+}
+
+#sidebar h6 {
+    font-size: small;
+    margin: 1em 0em 1em 0em;
+    text-align: center;
+}
+
+#content {
+}
+
+.category hr {
+    margin-left: 1em;
+}
+
+.category h2 {
+    margin-left: 5em;
+}
+
+.command {
+    border: 1px solid #a2a9b1;
+    margin-bottom: 1em;
+    margin-left: 8em;
+}
+
+.header {
+    border-bottom: groove;
+    background: #eaecf0;
+}
+
+.cmdname {
+    color: #0645ad;
+    font-weight: bold;
+    font-size: larger;
+}
+
+.cmdtype {
+    font-size: smaller;
+    font-style: italic;
+}
+
+.argname {
+    text-transform: uppercase;
+}
+
+.argtype {
+    font-size: smaller;
+    font-style: italic;
+}
+
+.nodocs {
+    font-size: smaller;
+    font-style: italic;
+}
+
+.description {
+}
+
+.administrivia {
+    font-size: smaller;
+    margin: 0;
+    padding: 0;
+}
+
+.administrivia ul {
+    margin: 0;
+    padding: 0;
+}
+
+.administrivia li {
+    list-style-type: none;
+}
+
+.administrivia li li {
+    list-style-type: disc;
+}
+
+.status {
+    font-size: smaller;
+}
+
+
+.st_ok {
+    border-left: 0.5em solid #88ff88;
+}
+
+.st_todo {
+    border-left: 0.5em solid #ff8888;
+}
+
+.st_maybe {
+    border-left: 0.5em solid #8888ff;
+}
+
+.header, .description, .status, .administrivia {
+    padding: 0.2em 0.4em;
+}

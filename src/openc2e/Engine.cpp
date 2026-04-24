@@ -1,0 +1,1247 @@
+/*
+ *  Engine.cpp
+ *  openc2e
+ *
+ *  Created by Alyssa Milburn on Tue Nov 28 2006.
+ *  Copyright (c) 2006-2008 Alyssa Milburn. All rights reserved.
+ *
+ *  This library is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU Lesser General Public
+ *  License as published by the Free Software Foundation; either
+ *  version 2 of the License, or (at your option) any later version.
+ *
+ *  This library is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  Lesser General Public License for more details.
+ *
+ */
+
+#include "Engine.h"
+
+#include "Bubble.h"
+#include "Camera.h"
+#include "DullPart.h"
+#include "Map.h"
+#include "MetaRoom.h"
+#include "MusicManager.h"
+#include "NetBackend.h"
+#include "PathResolver.h"
+#include "PointerAgent.h"
+#include "Room.h"
+#include "SFCFile.h"
+#include "SoundManager.h"
+#include "World.h"
+#include "caosScript.h" // for executeNetwork()
+#include "caosVM.h"
+#include "common/NornLog.h"
+#include "common/Ranges.h"
+#include "common/audio/NullAudioBackend.h"
+#include "common/backend/Keycodes.h"
+#include "common/backend/NullBackend.h"
+#include "common/case_insensitive_filesystem.h"
+#include "common/encoding.h"
+#include "common/io/FileWriter.h"
+#include "common/io/StringWriter.h"
+#include "common/io/WriterFmt.h"
+#include "common/userlocale.h"
+#include "fileformats/cfgFile.h"
+#include "fileformats/peFile.h"
+#include "imageManager.h"
+#include "openc2eimgui/ImGuiUtils.h"
+#include "openc2eimgui/Openc2eImGui.h"
+#include "prayManager.h"
+
+#ifdef _WIN32
+#include "common/ComPtr.h"
+#endif
+
+#include <cassert>
+#include <filesystem>
+#define CXXOPTS_VECTOR_DELIMITER '\0'
+#include <cxxopts.hpp>
+#include <fmt/core.h>
+#include <memory>
+#include <stdexcept>
+
+#ifdef _WIN32
+#include <shlobj.h>
+#include <windows.h>
+#else
+#include <pwd.h> // getpwuid
+#include <sys/types.h> // passwd*
+#endif
+
+namespace fs = std::filesystem;
+
+Engine engine;
+
+Engine::Engine() {
+	done = false;
+	dorendering = true;
+	fastticks = false;
+	refreshdisplay = false;
+
+	bmprenderer = false;
+
+	std::vector<std::string> languages = get_preferred_languages();
+	if (!languages.empty()) {
+		language = languages.front();
+	} else {
+		language = "en";
+	}
+
+	tickdata = 0;
+	for (unsigned int& ticktime : ticktimes)
+		ticktime = 0;
+	ticktimeptr = 0;
+	version = 0; // TODO: something something
+
+	cmdline_enable_sound = true;
+	cmdline_norun = false;
+
+	exefile = nullptr;
+
+	addPossibleBackend("null", NullBackend::get_instance());
+	addPossibleAudioBackend("null", NullAudioBackend::get_instance());
+
+	camera = std::make_unique<MainCamera>();
+}
+
+Engine::~Engine() {
+}
+
+void Engine::addPossibleBackend(std::string s, Backend* b) {
+	assert(!get_backend());
+	assert(b);
+	preferred_backend = s;
+	possible_backends[s] = b;
+}
+
+void Engine::addPossibleAudioBackend(std::string s, AudioBackend* b) {
+	assert(!get_audio_backend());
+	assert(b);
+	preferred_audiobackend = s;
+	possible_audiobackends[s] = b;
+}
+
+void Engine::setBackend(Backend* b) {
+	set_backend(b);
+	lasttimestamp = get_ticks_msec();
+}
+
+static std::vector<std::string> read_wordlist(peFile* exefile, PeLanguage lang) {
+	std::optional<resourceInfo> r = exefile->findResource(PE_RESOURCETYPE_STRING, lang, 14);
+	if (!r) {
+		fmt::print("Warning: Couldn't load word list (couldn't find resource)!\n");
+		return {};
+	}
+
+	std::vector<std::string> strings = exefile->getResourceStrings(*r);
+	if (strings.size() < 6) {
+		fmt::print("Warning: Couldn't load word list (string table too small)!\n");
+		return {};
+	}
+
+	std::string wordlistdata = utf8_to_cp1252(strings[5]);
+	std::vector<std::string> wordlist;
+	std::string s;
+	for (char i : wordlistdata) {
+		if (i == '|') {
+			wordlist.push_back(s);
+			s.clear();
+		} else
+			s += i;
+	}
+
+	return wordlist;
+}
+
+void Engine::loadGameData() {
+	// load word list translations for C1
+	// C1 does not keep translations for all languages, so we embed them
+	if (gametype == "c1") {
+		if (language == "de") {
+			wordlist_translations = std::map<std::string, std::string>{
+				{"come", "komm"},
+				{"drop", "lass"},
+				{"get", "hol"},
+				{"left", "links"},
+				{"look", "guck"},
+				{"no", "nein"},
+				{"pull", "zieh"},
+				{"push", "druck"},
+				{"right", "rechts"},
+				{"run", "lauf"},
+				{"sleep", "raste"},
+				{"stop", "halt"},
+				{"what", "was"},
+				{"yes", "ja"}};
+		} else if (language == "fr") {
+			wordlist_translations = std::map<std::string, std::string>{
+				{"come", "venir"},
+				{"drop", "lacher"},
+				{"get", "prendre"},
+				{"left", "gauche"},
+				{"look", "regarder"},
+				{"no", "non"},
+				{"pull", "tirer"},
+				{"push", "pousser"},
+				{"right", "droite"},
+				{"run", "courir"},
+				{"sleep", "se-reposer"},
+				{"stop", "arreter"},
+				{"what", "quoi"},
+				{"yes", "oui"}};
+		} else if (language == "it") {
+			wordlist_translations = std::map<std::string, std::string>{
+				{"come", "vieni"},
+				{"drop", "molla"},
+				{"get", "prendi"},
+				{"left", "sinistra"},
+				{"look", "guarda"},
+				{"no", "no"},
+				{"pull", "tira"},
+				{"push", "premi"},
+				{"right", "destra"},
+				{"run", "corri"},
+				{"sleep", "riposa"},
+				{"stop", "stop"},
+				{"what", "cosa"},
+				{"yes", "si"}};
+		} else if (language == "nl") {
+			wordlist_translations = std::map<std::string, std::string>{
+				{"come", "komen"},
+				{"drop", "latenvallen"},
+				{"get", "pakken"},
+				{"left", "links"},
+				{"look", "kijken"},
+				{"no", "nee"},
+				{"pull", "trekken"},
+				{"push", "duwen"},
+				{"right", "rechts"},
+				{"run", "rennen"},
+				{"sleep", "rusten"},
+				{"stop", "stoppen"},
+				{"what", "wat"},
+				{"yes", "ja"}};
+		} else if (language == "es") {
+			wordlist_translations = std::map<std::string, std::string>{
+				{"come", "venir"},
+				{"drop", "soltar"},
+				{"get", "coger"},
+				{"left", "izquierda"},
+				{"look", "mirar"},
+				{"no", "no"},
+				{"pull", "tirar"},
+				{"push", "empujar"},
+				{"right", "derecha"},
+				{"run", "correr"},
+				{"sleep", "descansar"},
+				{"stop", "parar"},
+				{"what", "que"},
+				{"yes", "si"}};
+		}
+	}
+
+	// load word list for C2
+	if (gametype == "c2") {
+		fs::path exepath(findMainDirectoryFile("Creatures2.exe"));
+		if (fs::exists(exepath) && !fs::is_directory(exepath)) {
+			try {
+				exefile = new peFile(exepath);
+			} catch (Exception& e) {
+				fmt::print("Warning: Couldn't load word list ({})!\n", e.what());
+			}
+		} else
+			fmt::print("Warning: Couldn't load word list (couldn't find Creatures2.exe)!\n");
+
+		if (exefile) {
+			auto english_wordlist = read_wordlist(exefile, PE_LANGUAGE_ENGLISH);
+
+			wordlist.clear();
+			wordlist_translations.clear();
+			if (language == "de") {
+				wordlist = read_wordlist(exefile, PE_LANGUAGE_GERMAN);
+			} else if (language == "fr") {
+				wordlist = read_wordlist(exefile, PE_LANGUAGE_FRENCH);
+			} else if (language == "it") {
+				wordlist = read_wordlist(exefile, PE_LANGUAGE_ITALIAN);
+			} else if (language == "nl") {
+				wordlist = read_wordlist(exefile, PE_LANGUAGE_DUTCH);
+			} else if (language == "es") {
+				wordlist = read_wordlist(exefile, PE_LANGUAGE_SPANISH);
+			}
+
+			if (wordlist.empty()) {
+				wordlist = english_wordlist;
+			} else {
+				for (size_t i = 0; i < english_wordlist.size() && i < wordlist.size(); ++i) {
+					wordlist_translations[english_wordlist[i]] = wordlist[i];
+				}
+			}
+		}
+	}
+}
+
+std::string Engine::translateWordlistWord(const std::string& s) {
+	auto it = wordlist_translations.find(s);
+	if (it == wordlist_translations.end()) {
+		return s;
+	} else {
+		return it->second;
+	}
+}
+
+std::string Engine::executeNetwork(std::string in) {
+	// now parse and execute the CAOS we obtained
+	caosVM vm(nullptr); // needs to be outside 'try' so we can reset outputstream on exception
+	try {
+		caosScript script(gametype, "<network>"); // XXX
+		script.parse(in);
+		script.installScripts();
+		StringWriter o;
+		vm.outputstream = &o;
+		vm.runEntirely(script.installer);
+		vm.outputstream = nullptr; // otherwise would point to dead stack
+		return o.string();
+	} catch (Exception& e) {
+		vm.outputstream = nullptr; // otherwise would point to dead stack
+		return std::string("### EXCEPTION: ") + e.what();
+	}
+}
+
+unsigned int Engine::msUntilTick() {
+	if (fastticks)
+		return 0;
+	if (world.paused)
+		return world.ticktime; // TODO: correct?
+
+	int ival = (tickdata + world.ticktime) - get_ticks_msec();
+	return (ival < 0) ? 0 : ival;
+}
+
+void Engine::drawWorld() {
+	// draw the world
+
+	Openc2eImGui::Update();
+	get_backend()->getMainRenderTarget()->setViewportOffsetTop(Openc2eImGui::GetViewportOffsetTop());
+	get_backend()->getMainRenderTarget()->setViewportOffsetBottom(Openc2eImGui::GetViewportOffsetBottom());
+
+	if (dorendering || refreshdisplay) {
+		refreshdisplay = false;
+		world.drawWorld(camera.get(), get_backend()->getMainRenderTarget().get());
+	}
+}
+
+static std::chrono::steady_clock::time_point program_started = std::chrono::steady_clock::now();
+uint32_t Engine::get_ticks_msec() const {
+	// TODO: this will wrap every ~49 days, not good. Use a 64-bit result or handle this differently
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - program_started).count();
+}
+
+void Engine::update() {
+	tickdata = get_ticks_msec();
+
+	// tick the world
+	world.tick();
+
+	// update sounds
+	soundmanager.tick();
+
+	// play C1 background wavs and MNG and MIDI music
+	musicmanager->tick();
+
+	// update our data for things like pace, race, ticktime, etc
+	ticktimes[ticktimeptr] = get_ticks_msec() - tickdata;
+	ticktimeptr++;
+	if (ticktimeptr == 10)
+		ticktimeptr = 0;
+	float avgtime = 0;
+	for (unsigned int ticktime : ticktimes)
+		avgtime += ((float)ticktime / world.ticktime);
+	world.pace = avgtime / 10;
+
+	world.race = get_ticks_msec() - lasttimestamp;
+	lasttimestamp = get_ticks_msec();
+
+	// periodic performance logging (every 100 ticks)
+	if (world.tickcount % 100 == 0) {
+		float tick_ms = static_cast<float>(ticktimes[ticktimeptr == 0 ? 9 : ticktimeptr - 1]);
+		float fps = world.pace > 0.0f ? (1000.0f / (world.pace * world.ticktime)) : 0.0f;
+		int agent_count = static_cast<int>(world.agents.size());
+		NornLogger::instance().logPerf(PerfSnapshot{
+			static_cast<double>(tick_ms),
+			static_cast<double>(world.race),
+			agent_count,
+			static_cast<double>(fps)});
+	}
+}
+
+bool Engine::tick() {
+	assert(get_backend());
+
+	// tick if necessary
+	bool needupdate = fastticks || !get_ticks_msec() || (get_ticks_msec() - tickdata >= world.ticktime - 5);
+	if (needupdate && !world.paused) {
+		if (fastticks) {
+			using clock = std::chrono::steady_clock;
+			using std::chrono::duration_cast;
+			using std::chrono::milliseconds;
+			auto start = clock::now();
+			while (duration_cast<milliseconds>(clock::now() - start).count() < 1000 / world.ticktime) {
+				update();
+			}
+		} else {
+			update();
+		}
+	}
+
+	processEvents();
+	if (needupdate)
+		handleKeyboardScrolling();
+
+	return needupdate;
+}
+
+void Engine::handleKeyboardScrolling() {
+	// keyboard-based scrolling
+	static float accelspeed = 8, decelspeed = .5, maxspeed = 64;
+	static float velx = 0;
+	static float vely = 0;
+
+	bool wasdMode = false;
+	caosValue v = world.variables["engine_wasd"];
+	if (v.hasInt()) {
+		switch (v.getInt()) {
+			case 1: // enable if CTRL is held
+				wasdMode = get_backend()->keyDown(OPENC2E_KEY_CTRL);
+				break;
+			case 2: // enable unconditionally
+				// (this needs agent support to suppress chat bubbles etc)
+				wasdMode = true;
+				break;
+			case 0: // disable
+				wasdMode = false;
+				break;
+			default: // disable
+				fmt::print("Warning: engine_wasd_scrolling is set to unknown value {}\n", v.getInt());
+				world.variables["engine_wasd_scrolling"] = caosValue(0);
+				wasdMode = false;
+				break;
+		}
+	}
+
+	// check keys
+	bool leftdown = get_backend()->keyDown(OPENC2E_KEY_LEFT) || (wasdMode && a_down);
+	bool rightdown = get_backend()->keyDown(OPENC2E_KEY_RIGHT) || (wasdMode && d_down);
+	bool updown = get_backend()->keyDown(OPENC2E_KEY_UP) || (wasdMode && w_down);
+	bool downdown = get_backend()->keyDown(OPENC2E_KEY_DOWN) || (wasdMode && s_down);
+
+	if (leftdown)
+		velx -= accelspeed;
+	if (rightdown)
+		velx += accelspeed;
+	if (!leftdown && !rightdown) {
+		velx *= decelspeed;
+		if (fabs(velx) < 0.1)
+			velx = 0;
+	}
+	if (updown)
+		vely -= accelspeed;
+	if (downdown)
+		vely += accelspeed;
+	if (!updown && !downdown) {
+		vely *= decelspeed;
+		if (fabs(vely) < 0.1)
+			vely = 0;
+	}
+
+	// enforced maximum speed
+	if (velx >= maxspeed)
+		velx = maxspeed;
+	else if (velx <= -maxspeed)
+		velx = -maxspeed;
+	if (vely >= maxspeed)
+		vely = maxspeed;
+	else if (vely <= -maxspeed)
+		vely = -maxspeed;
+
+	// do the actual movement
+	if (velx || vely) {
+		int adjustx = engine.camera->getX(), adjusty = engine.camera->getY();
+		int adjustbyx = (int)velx, adjustbyy = (int)vely;
+
+		engine.camera->moveTo(adjustx + adjustbyx, adjusty + adjustbyy, jump);
+	}
+}
+
+void Engine::processEvents() {
+	net->handleEvents();
+
+	BackendEvent event;
+	while (get_backend()->pollEvent(event)) {
+		switch (event.type) {
+			case eventresizewindow:
+				handleResizedWindow();
+				break;
+
+			case eventmousemove:
+				handleMouseMove(event);
+				break;
+
+			case eventmousebuttonup:
+			case eventmousebuttondown:
+				handleMouseButton(event);
+				break;
+
+			case eventtextinput:
+				handleTextInput(event);
+				break;
+
+			case eventrawkeydown:
+				handleRawKeyDown(event);
+				break;
+
+			case eventrawkeyup:
+				handleRawKeyUp(event);
+				break;
+
+			case eventquit:
+				done = true;
+				break;
+
+			default:
+				break;
+		}
+	}
+}
+
+void Engine::handleResizedWindow() {
+	// notify agents
+	for (auto& a : world.agents) {
+		if (!a)
+			continue;
+		a->queueScript(123, 0); // window resized script
+	}
+}
+
+void Engine::handleMouseMove(BackendEvent& event) {
+	// move the cursor
+	world.hand()->handleEvent(event);
+
+	// notify agents
+	for (std::list<std::shared_ptr<Agent>>::iterator i = world.agents.begin(); i != world.agents.end(); i++) {
+		if (!*i)
+			continue;
+		if ((*i)->imsk_mouse_move) {
+			caosValue x;
+			x.setFloat(world.hand()->pointerX());
+			caosValue y;
+			y.setFloat(world.hand()->pointerY());
+			(*i)->queueScript(75, 0, x, y); // Raw Mouse Move
+		}
+	}
+}
+
+void Engine::handleMouseButton(BackendEvent& event) {
+	// notify agents
+	for (auto& agent : world.agents) {
+		if (!agent)
+			continue;
+		if ((event.type == eventmousebuttonup && agent->imsk_mouse_up) ||
+			(event.type == eventmousebuttondown && agent->imsk_mouse_down)) {
+			// set the button value as necessary
+			caosValue button;
+			switch (event.button) { // Backend guarantees that only one button will be set on a mousebuttondown event.
+				// the values here make fuzzie suspicious that c2e combines these events
+				// nornagon seems to think c2e doesn't
+				case buttonleft: button.setInt(1); break;
+				case buttonright: button.setInt(2); break;
+				case buttonmiddle: button.setInt(4); break;
+				default: break;
+			}
+
+			// if it was a mouse button we're interested in, then fire the relevant raw event
+			if (button.getInt() != 0) {
+				if (event.type == eventmousebuttonup)
+					agent->queueScript(77, 0, button); // Raw Mouse Up
+				else
+					agent->queueScript(76, 0, button); // Raw Mouse Down
+			}
+		}
+		if ((event.type == eventmousebuttondown &&
+				(event.button == buttonwheelup || event.button == buttonwheeldown) &&
+				agent->imsk_mouse_wheel)) {
+			// fire the mouse wheel event with the relevant delta value
+			caosValue delta;
+			if (event.button == buttonwheeldown)
+				delta.setInt(-120);
+			else
+				delta.setInt(120);
+			agent->queueScript(78, 0, delta); // Raw Mouse Wheel
+		}
+	}
+
+	world.hand()->handleEvent(event);
+}
+
+void Engine::handleTextInput(BackendEvent& event) {
+	std::string cp1252_text;
+	try {
+		cp1252_text = utf8_to_cp1252(event.text);
+	} catch (std::domain_error& e) {
+		// ignore, will be printed next
+	}
+	if (cp1252_text.size() != 1) {
+		fmt::print(stderr, "bad text input: ");
+		for (unsigned char c : event.text) {
+			fmt::print(stderr, "0x{:02x} ", c);
+		}
+		fmt::print(stderr, "\n");
+	}
+
+	int translated_char = cp1252_text[0];
+
+	if (cp1252_isprint(translated_char)) {
+		if (version < 3 && !world.focusagent) {
+			Bubble::newBubble(world.hand(), false, std::string());
+		}
+	}
+
+	// tell the agent with keyboard focus
+	if (world.focusagent) {
+		auto focused = world.focusagent.safeGet();  // NB: safe access — may be pending_kill
+		if (focused) {
+			CompoundPart* t = focused->part(world.focuspart);
+			if (t && t->canGainFocus())
+				t->handleTranslatedChar(translated_char);
+		}
+	}
+
+	// notify agents
+	caosValue k;
+	k.setInt(translated_char);
+	for (auto& agent : world.agents) {
+		if (!agent)
+			continue;
+		if (agent->imsk_translated_char)
+			agent->queueScript(79, 0, k); // translated char script
+	}
+}
+
+void Engine::handleRawKeyUp(BackendEvent& event) {
+	switch (event.key) {
+		case OPENC2E_KEY_W:
+			w_down = false;
+			break;
+		case OPENC2E_KEY_A:
+			a_down = false;
+			break;
+		case OPENC2E_KEY_S:
+			s_down = false;
+			break;
+		case OPENC2E_KEY_D:
+			d_down = false;
+			break;
+		default:
+			break;
+	}
+}
+
+void Engine::handleRawKeyDown(BackendEvent& event) {
+	switch (event.key) {
+		case OPENC2E_KEY_W:
+			w_down = true;
+			break;
+		case OPENC2E_KEY_A:
+			a_down = true;
+			break;
+		case OPENC2E_KEY_S:
+			s_down = true;
+			break;
+		case OPENC2E_KEY_D:
+			d_down = true;
+			break;
+		default:
+			break;
+	}
+
+	// handle debug keys, if they're enabled
+	caosValue v = world.variables["engine_debug_keys"];
+	if (v.hasInt() && v.getInt() == 1) {
+		if (get_backend()->keyDown(OPENC2E_KEY_SHIFT)) {
+			MetaRoom* n; // for pageup/pagedown
+
+			switch (event.key) {
+				case OPENC2E_KEY_INSERT:
+					world.showrooms = !world.showrooms;
+					break;
+
+				case OPENC2E_KEY_PAUSE:
+					// TODO: debug pause game
+					break;
+
+				case OPENC2E_KEY_SPACE:
+					// TODO: force tick
+					break;
+
+				case OPENC2E_KEY_PAGEUP:
+					// TODO: previous metaroom
+					if ((world.map->getMetaRoomCount() - 1) == engine.camera->getMetaRoom()->id)
+						break;
+					n = world.map->getMetaRoom(engine.camera->getMetaRoom()->id + 1);
+					if (n)
+						engine.camera->goToMetaRoom(n->id);
+					break;
+
+				case OPENC2E_KEY_PAGEDOWN:
+					// TODO: next metaroom
+					if (engine.camera->getMetaRoom()->id == 0)
+						break;
+					n = world.map->getMetaRoom(engine.camera->getMetaRoom()->id - 1);
+					if (n)
+						engine.camera->goToMetaRoom(n->id);
+					break;
+
+				default: break; // to shut up warnings
+			}
+		}
+	}
+
+	// tell the agent with keyboard focus
+	if (world.focusagent) {
+		auto focused = world.focusagent.safeGet();  // NB: safe access — may be pending_kill
+		if (focused) {
+			CompoundPart* t = focused->part(world.focuspart);
+			if (t && t->canGainFocus())
+				t->handleRawKey(event.key);
+		}
+	}
+
+	// notify agents
+	caosValue k;
+	k.setInt(event.key);
+	for (auto& agent : world.agents) {
+		if (!agent)
+			continue;
+		if (agent->imsk_key_down)
+			agent->queueScript(73, 0, k); // key down script
+	}
+
+	// certain raw keys get passed as translated chars, too, after the raw key event
+	// these correspond to the CP1252/ASCII control codes
+	// TODO: should this be handled in Backend instead?
+	BackendEvent translatedevent;
+	translatedevent.type = eventtextinput;
+	switch (event.key) {
+		case OPENC2E_KEY_BACKSPACE:
+			translatedevent.text = "\x08";
+			break;
+		case OPENC2E_KEY_TAB:
+			translatedevent.text = "\t";
+			break;
+		case OPENC2E_KEY_RETURN:
+			translatedevent.text = "\n";
+			break;
+		case OPENC2E_KEY_ESCAPE:
+			translatedevent.text = "\x1b";
+			break;
+		case OPENC2E_KEY_DELETE:
+			translatedevent.text = "\x7f";
+			break;
+		default:
+			break;
+	}
+	if (translatedevent.text.size()) {
+		handleTextInput(translatedevent);
+	}
+}
+
+static const char data_default[] = "./data";
+
+static void opt_version() {
+	// We already showed the primary version bit, just throw in some random legalese
+	fmt::print("This is free software; see the source for copying conditions.  There is NO\n"
+			   "warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n"
+			   "\n"
+			   "...please don't sue us.\n");
+}
+
+static std::string detectGameType(fs::path directory) {
+	if (case_insensitive_filesystem::exists(directory / "creatures.exe")) {
+		return "c1";
+	}
+	if (case_insensitive_filesystem::exists(directory / "creatures2.exe")) {
+		return "c2";
+	}
+
+	auto catalogue_directory = directory / "Catalogue";
+	std::error_code err;
+	auto machine_cfg_filename = case_insensitive_filesystem::canonical(directory / "machine.cfg", err);
+	if (!err) {
+		auto machine_cfg = readcfgfile(machine_cfg_filename);
+		if (machine_cfg.count("Catalogue Directory")) {
+			catalogue_directory = machine_cfg["Catalogue Directory"];
+			if (!catalogue_directory.is_absolute()) {
+				catalogue_directory = directory / catalogue_directory;
+			}
+		}
+	}
+
+	if (case_insensitive_filesystem::exists(catalogue_directory / "Docking Station.catalogue")) {
+		return "ds";
+	}
+	if (case_insensitive_filesystem::exists(catalogue_directory / "Creatures 3.catalogue")) {
+		return "c3";
+	}
+	if (case_insensitive_filesystem::exists(catalogue_directory / "Creatures Adventures.catalogue")) {
+		return "cv";
+	}
+	if (case_insensitive_filesystem::exists(catalogue_directory / "Sea Monkeys.catalogue")) {
+		return "sm";
+	}
+	throw Exception("Couldn't auto-detect game type");
+}
+
+static std::vector<DataDirectory> data_directories_from_machine_cfg(fs::path machine_cfg_filename) {
+	auto parent_directory = machine_cfg_filename.parent_path();
+	std::error_code err;
+	machine_cfg_filename = case_insensitive_filesystem::canonical(machine_cfg_filename, err);
+	if (err) {
+		return {parent_directory};
+	}
+
+	std::vector<DataDirectory> result;
+	auto normalize = [&](fs::path s) {
+		if (s.empty()) {
+			return s;
+		}
+		if (s.is_absolute()) {
+			return s.lexically_normal();
+		}
+		return fs::absolute((parent_directory / s).lexically_normal());
+	};
+	auto machine_cfg = readcfgfile(machine_cfg_filename);
+	if (!machine_cfg.count("Main Directory")) {
+		throw Exception("machine.cfg missing \"Main Directory\"");
+	}
+	DataDirectory dir(normalize(machine_cfg["Main Directory"]));
+	dir.backgrounds = normalize(machine_cfg["Backgrounds Directory"]);
+	dir.body_data = normalize(machine_cfg["Body Data Directory"]);
+	dir.bootstrap = normalize(machine_cfg["Bootstrap Directory"]);
+	dir.catalogue = normalize(machine_cfg["Catalogue Directory"]);
+	dir.creature_galleries = normalize(machine_cfg["Creature Galleries Directory"]);
+	dir.exported_creatures = normalize(machine_cfg["Exported Creatures Directory"]);
+	dir.genetics = normalize(machine_cfg["Genetics Directory"]);
+	dir.images = normalize(machine_cfg["Images Directory"]);
+	dir.journal = normalize(machine_cfg["Journal Directory"]);
+	dir.overlay_data = normalize(machine_cfg["Overlay Data Directory"]);
+	dir.agents = normalize(machine_cfg["Resource Files Directory"]);
+	dir.sounds = normalize(machine_cfg["Sounds Directory"]);
+	dir.users = normalize(machine_cfg["Users Directory"]);
+	dir.worlds = normalize(machine_cfg["Worlds Directory"]);
+	result.push_back(dir);
+
+	for (int i = 1;; ++i) {
+		std::string prefix = fmt::format("Auxiliary {} ", i);
+		if (!find_if(machine_cfg, [&](auto& kv) { return kv.first.rfind(prefix) == 0; })) {
+			break;
+		}
+		if (!machine_cfg.count(prefix + "Main Directory")) {
+			throw Exception(fmt::format("machine.cfg missing \"{}Main Directory\"", prefix));
+		}
+		DataDirectory dir(normalize(machine_cfg[prefix + "Main Directory"]));
+		dir.backgrounds = normalize(machine_cfg[prefix + "Backgrounds Directory"]);
+		dir.body_data = normalize(machine_cfg[prefix + "Body Data Directory"]);
+		dir.bootstrap = normalize(machine_cfg[prefix + "Bootstrap Directory"]);
+		dir.catalogue = normalize(machine_cfg[prefix + "Catalogue Directory"]);
+		dir.creature_galleries = normalize(machine_cfg[prefix + "Creature Galleries Directory"]);
+		dir.exported_creatures = normalize(machine_cfg[prefix + "Exported Creatures Directory"]);
+		dir.genetics = normalize(machine_cfg[prefix + "Genetics Directory"]);
+		dir.images = normalize(machine_cfg[prefix + "Images Directory"]);
+		dir.journal = normalize(machine_cfg[prefix + "Journal Directory"]);
+		dir.overlay_data = normalize(machine_cfg[prefix + "Overlay Data Directory"]);
+		dir.agents = normalize(machine_cfg[prefix + "Resource Files Directory"]);
+		dir.sounds = normalize(machine_cfg[prefix + "Sounds Directory"]);
+		dir.users = normalize(machine_cfg[prefix + "Users Directory"]);
+		dir.worlds = normalize(machine_cfg[prefix + "Worlds Directory"]);
+		result.push_back(dir);
+	}
+	return result;
+}
+
+#ifdef _WIN32
+static fs::path showDirectoryPicker() {
+	if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+		// TODO: handle RPC_E_CHANGED_MODE, we can continu w/ a multithreaded COM.
+		return {};
+	}
+
+	struct coinit_scope {
+		~coinit_scope() { CoUninitialize(); }
+	} coinit_scope_instance;
+
+	ComPtr<IFileOpenDialog> fo;
+	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_IFileOpenDialog, fo.receive_vpp()))) {
+		fmt::print("Couldn't open File Dialog\n");
+		return {};
+	}
+	fo->SetOptions(FOS_PICKFOLDERS);
+
+	// Show the Open dialog box.
+	if (FAILED(fo->Show(nullptr))) {
+		fmt::print("Couldn't show File Open Dialog\n");
+		return {};
+	}
+
+	// Get the file name from the dialog box.
+	ComPtr<IShellItem> pItem;
+	if (FAILED(fo->GetResult(pItem.receive()))) {
+		return {};
+	}
+
+	ComHeapPtr<WCHAR> pszFilePath;
+	if (FAILED(pItem->GetDisplayName(SIGDN_FILESYSPATH, pszFilePath.receive()))) {
+		return {};
+	}
+
+	return fs::path(pszFilePath.get());
+}
+#endif
+
+bool Engine::parseCommandLine(int argc, char* argv[]) {
+	// variables for command-line flags
+	std::vector<std::string> data_vec;
+
+	// generate help for backend options
+	std::string available_backends;
+	for (auto& possible_backend : possible_backends) {
+		if (available_backends.empty())
+			available_backends = possible_backend.first;
+		else
+			available_backends += ", " + possible_backend.first;
+	}
+	available_backends = "Select the backend (options: " + available_backends + "); default is " + preferred_backend;
+
+	std::string available_audiobackends;
+	for (auto& possible_audiobackend : possible_audiobackends) {
+		if (available_audiobackends.empty())
+			available_audiobackends = possible_audiobackend.first;
+		else
+			available_audiobackends += ", " + possible_audiobackend.first;
+	}
+	available_audiobackends = "Select the audio backend (options: " + available_audiobackends + "); default is " + preferred_audiobackend;
+
+	// parse the command-line flags
+	cxxopts::Options desc("openc2e", "");
+	desc.add_options()("h,help", "Display help on command-line options");
+	desc.add_options()("V,version", "Display openc2e version");
+	desc.add_options()("s,silent", "Disable all sounds");
+	desc.add_options()("l,language", "Select the language; default is '" + language + "'", cxxopts::value<std::string>(language));
+	desc.add_options()("k,backend", available_backends, cxxopts::value<std::string>(preferred_backend));
+	desc.add_options()("o,audiobackend", available_audiobackends, cxxopts::value<std::string>(preferred_audiobackend));
+	desc.add_options()("d,data-path", "Sets or adds a path to a data directory", cxxopts::value<std::vector<std::string>>(data_vec));
+	desc.add_options()("b,bootstrap", "Sets or adds a path or COS file to bootstrap from", cxxopts::value<std::vector<std::string>>(cmdline_bootstrap));
+	desc.add_options()("m,gamename", "Set the game name", cxxopts::value<std::string>(gamename));
+	desc.add_options()("n,norun", "Don't run the game, just execute scripts");
+	desc.add_options()("a,autokill", "Enable autokill");
+	desc.add_options()("autostop", "Enable autostop (or disable it, for CV)");
+	desc.add_options()("brain-module", "Path to Python brain module (.py)", cxxopts::value<std::string>(brain_module_path_));
+	auto vm = desc.parse(argc, argv);
+	cmdline_enable_sound = !vm.count("silent");
+	cmdline_norun = vm.count("norun");
+
+	if (vm.count("help")) {
+		fmt::print("{}\n", desc.help());
+		return false;
+	}
+
+	if (vm.count("version")) {
+		opt_version();
+		return false;
+	}
+
+	if (vm.count("autokill")) {
+		world.autokill = true;
+	}
+
+	if (vm.count("autostop")) {
+		world.autostop = true;
+	}
+
+	if (vm.count("data-path") == 0) {
+#ifdef _WIN32
+		fs::path picked_path = showDirectoryPicker();
+		if (!picked_path.empty()) {
+			data_vec.push_back(picked_path.string());
+		}
+#endif
+		if (data_vec.empty()) {
+			fmt::print("Warning: No data path specified, trying default of '{}', see --help if you need to specify one.\n", data_default);
+			data_vec.push_back(data_default);
+		}
+	}
+
+	// detect game type from first data directory
+	gametype = detectGameType(data_vec[0]);
+	fmt::print("* Detected game type: {}\n", gametype);
+
+	// set engine version
+	// TODO: set gamename
+	if (gametype == "c1") {
+		if (gamename.empty())
+			gamename = "Creatures 1";
+		version = 1;
+	} else if (gametype == "c2") {
+		if (gamename.empty())
+			gamename = "Creatures 2";
+		version = 2;
+	} else if (gametype == "c3") {
+		if (gamename.empty()) {
+			gamename = "Creatures 3";
+		}
+		version = 3;
+	} else if (gametype == "ds") {
+		gametype = "c3";
+		if (gamename.empty()) {
+			gamename = "Docking Station";
+		}
+		version = 3;
+	} else if (gametype == "cv") {
+		if (gamename.empty())
+			gamename = "Creatures Village";
+		version = 3;
+		world.autostop = !world.autostop;
+	} else if (gametype == "sm") {
+		if (gamename.empty())
+			gamename = "Sea-Monkeys";
+		version = 3;
+		bmprenderer = true;
+	} else
+		throw Exception(fmt::format("unknown gametype '{}'!", gametype));
+
+	// try to read machine.cfg
+	if (!fs::exists(data_vec[0])) {
+		throw Exception("data path '" + data_vec[0] + "' doesn't exist");
+	}
+	if (engine.version == 3) {
+		data_directories = data_directories_from_machine_cfg(fs::path(data_vec[0]) / "machine.cfg");
+	} else {
+		data_directories.push_back(fs::path(data_vec[0]));
+	}
+
+	// add remaining data directories
+	for (auto it = data_vec.begin() + 1; it != data_vec.end(); ++it) {
+		if (!fs::exists(*it)) {
+			throw Exception("data path '" + *it + "' doesn't exist");
+		}
+		if (find_if(data_directories, [&](auto d) { return fs::absolute(d.main) == fs::absolute(*it); })) {
+			fmt::print("* Warning: ignoring duplicate data directory {}\n", *it);
+			continue;
+		}
+		data_directories.push_back(fs::path(*it));
+	}
+
+	// make a vague attempt at blacklisting some characters inside the gamename
+	// (it's used in directory names, registry keys, etc)
+	std::string invalidchars = "\\/:*?\"<>|";
+	for (char invalidchar : invalidchars) {
+		if (gamename.find(invalidchar) != gamename.npos)
+			throw Exception(std::string("The character ") + invalidchar + " is not valid in a gamename.");
+	}
+
+	return true;
+}
+
+bool Engine::initialSetup() {
+	assert(data_directories.size() > 0);
+	NORN_INF(ENGINE, "Engine::initialSetup() beginning");
+
+	// finally, add our cache directory to the end
+	data_directories.push_back(storageDirectory());
+	NORN_INF(ENGINE, fmt::format("Data directories configured ({}), storage: {}", data_directories.size(), storageDirectory().string()));
+
+	// initialize backends
+	if (cmdline_norun)
+		preferred_backend = "null";
+	NORN_INF(ENGINE, fmt::format("Initialising backend: {}", preferred_backend));
+	if (preferred_backend != "null")
+		fmt::print("* Initialising backend {}...\n", preferred_backend);
+	Backend* b = possible_backends[preferred_backend];
+	if (!b) {
+		NORN_ERR(ENGINE, fmt::format("No such backend: {}", preferred_backend));
+		throw Exception("No such backend " + preferred_backend);
+	}
+	b->init(
+		gamename.size() ? gamename + " - openc2e x64 (development build)" : "openc2e x64 (development build)",
+		OPENC2E_DEFAULT_WIDTH,
+		OPENC2E_DEFAULT_HEIGHT);
+	setBackend(b);
+	possible_backends.clear();
+	Openc2eImGui::Init();
+	NORN_INF(ENGINE, fmt::format("Backend '{}' initialised successfully", preferred_backend));
+
+	if (cmdline_norun)
+		preferred_audiobackend = "null";
+	NORN_INF(ENGINE, fmt::format("Initialising audio backend: {}", preferred_audiobackend));
+	if (preferred_audiobackend != "null")
+		fmt::print("* Initialising audio backend {}...\n", preferred_audiobackend);
+	AudioBackend* a = possible_audiobackends[preferred_audiobackend];
+	if (!a) {
+		NORN_ERR(ENGINE, fmt::format("No such audio backend: {}", preferred_audiobackend));
+		throw Exception("No such audio backend " + preferred_audiobackend);
+	}
+	try {
+		a->init();
+		set_audio_backend(a);
+		NORN_INF(ENGINE, fmt::format("Audio backend '{}' initialised successfully", preferred_audiobackend));
+	} catch (Exception& e) {
+		NORN_ERR(ENGINE, fmt::format("Audio backend '{}' failed: {}; continuing without sound", preferred_audiobackend, e.what()));
+		fmt::print("* Couldn't initialize backend {}: {}\n", preferred_audiobackend, e.what());
+		fmt::print("* Continuing without sound.\n");
+		set_audio_backend(NullAudioBackend::get_instance());
+		get_audio_backend()->init();
+	}
+	possible_audiobackends.clear();
+
+	net = std::make_shared<NetBackend>();
+	int listenport = net->init();
+	if (listenport != -1) {
+		NORN_INF(ENGINE, fmt::format("Network backend listening on port {}", listenport));
+		// inform the user of the port used, and store it in the relevant file
+		fmt::print("* Listening for connections on port {}.\n", listenport);
+#ifndef _WIN32
+		fs::path p = homeDirectory() / ".creaturesengine";
+		if (!fs::exists(p))
+			fs::create_directory(p);
+		if (fs::is_directory(p)) {
+			FileWriter f(p / "port");
+			fmt::print(f, "{}", listenport);
+		}
+#endif
+	}
+
+	// load palette for C1
+	world.gallery->loadDefaultPalette();
+
+	// audio
+	musicmanager = std::make_unique<MusicManager>();
+	if (!cmdline_enable_sound) {
+		soundmanager.setMuted(true);
+		musicmanager->setMuted(true);
+		musicmanager->setMIDIMuted(true);
+	}
+
+	// initial setup
+	if (engine.version == 3) {
+		fmt::print("* Reading catalogue files...\n");
+		NORN_INF(ENGINE, "Reading catalogue files");
+		world.initCatalogue();
+		NORN_INF(ENGINE, "Catalogue files loaded");
+	}
+	fmt::print("* Initial setup...\n");
+	NORN_INF(ENGINE, "World init beginning");
+	world.init(); // just reads mouse cursor (we want this after the catalogue reading so we don't play "guess the filename")
+	NORN_INF(ENGINE, "World init complete");
+	if (engine.version > 2) {
+		fmt::print("* Reading PRAY files...\n");
+		NORN_INF(ENGINE, "Reading PRAY files");
+		world.praymanager->update();
+		NORN_INF(ENGINE, "PRAY files loaded");
+	}
+
+#ifdef _WIN32
+	// Here we need to set the working directory since apparently windows != clever
+	char exepath[MAX_PATH] = "";
+	GetModuleFileName(nullptr, exepath, sizeof(exepath) - 1);
+	char* exedir = strrchr(exepath, '\\');
+	if (exedir) {
+		// null terminate the string
+		*exedir = 0;
+		// Set working directory
+		SetCurrentDirectory(exepath);
+	} else // err, oops
+		fmt::print(stderr, "Warning: Setting working directory to {} failed.\n", exepath);
+#endif
+
+	loadGameData();
+
+	// execute the initial scripts!
+	NORN_INF(ENGINE, "Executing initial bootstrap scripts");
+	fmt::print("* Executing initial scripts...\n");
+	if (cmdline_bootstrap.size() == 0) {
+		world.executeBootstrap(false);
+	} else {
+		std::vector<std::string> scripts;
+
+		if (engine.version < 3 && cmdline_bootstrap.size() != 1)
+			throw Exception("multiple bootstrap files provided in C1/C2 mode");
+
+		for (auto& bsi : cmdline_bootstrap) {
+			fs::path scriptdir(bsi);
+			if (engine.version > 2 || scriptdir.extension().string() == ".cos") {
+				// pass it to the world to execute (it handles both files and directories)
+
+				if (!fs::exists(scriptdir)) {
+					fmt::print(stderr, "Warning: Couldn't find a specified script directory (trying {})!\n", bsi);
+					continue;
+				}
+
+				world.executeBootstrap(scriptdir.string());
+			} else {
+				// in c1/c2 mode, if not a cos file, assume it's an SFC file
+				if (!fs::exists(scriptdir) || fs::is_directory(scriptdir))
+					throw Exception("non-existant bootstrap file provided in C1/C2 mode");
+				// TODO: the default SFCFile loading code is in World, maybe this should be too..
+				SFCFile sfc;
+				FileReader f(scriptdir);
+				sfc.read(&f);
+				sfc.copyToWorld();
+			}
+		}
+	}
+
+	// if there aren't any metarooms, we can't run a useful game, the user probably
+	// wanted to execute a CAOS script or something went badly wrong.
+	if (!cmdline_norun && world.map->getMetaRoomCount() == 0) {
+		shutdown();
+		throw Exception("No metarooms found in given bootstrap directories or files");
+	}
+
+	fmt::print("* Done startup.\n");
+	NORN_INF(ENGINE, fmt::format("Engine startup complete (game: {}, version: {})", gamename, version));
+
+	if (cmdline_norun) {
+		// TODO: see comment above about avoiding backend when norun is set
+		fmt::print("Told not to run the world, so stopping now.\n");
+		shutdown();
+		return false;
+	}
+
+	// Let agents know the window size (makes the DS sound options panel update
+	// to match actual engine state when starting muted)
+	// TODO: does this happen in real c2e?
+	handleResizedWindow();
+
+	return true;
+}
+
+void Engine::shutdown() {
+	NORN_INF(ENGINE, "Engine::shutdown() beginning");
+
+	// first kill all world state, then start killing backend components
+	world.shutdown();
+
+	// musicmanager might still hold audio handles, so release them before
+	// (1) the audio backend gets shut down and (2) this engine object is
+	// destructed which may happen after audio backend statics get destructed
+	musicmanager.reset();
+
+	// backends should be okay to kill now
+	get_audio_backend()->shutdown();
+	get_backend()->shutdown();
+	net->shutdown();
+
+	NORN_INF(ENGINE, "Engine::shutdown() complete");
+}

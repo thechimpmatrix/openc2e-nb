@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: TRUE
+  # GitHub runners have two cores each
+  MAKEFLAGS: -j3 -k
+  # set some variables for Visual Studio
+  MultiProcessorCompilation: true
+  UseMultiToolTask: true
+  EnforceProcessCountAcrossBuilds: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - name: "Check out source"
+      uses: actions/checkout@v3
+    - name: "Install clang-format"
+      run: |
+        wget https://github.com/muttleyxd/clang-tools-static-binaries/releases/download/master-22538c65/clang-format-10_linux-amd64
+        chmod +x clang-format-10_linux-amd64
+        mv clang-format-10_linux-amd64 /usr/local/bin/clang-format
+    - name: "clang-format"
+      run: ./scripts/lint.py -v 0000000 # diff from null sha is every file
+      
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest,ubuntu-latest,macos-latest]
+    steps:
+    - name: "Check out source"
+      uses: actions/checkout@v3
+    - name: "Install dependencies (Ubuntu)"
+      if: "startsWith(matrix.os, 'ubuntu-')"
+      run: sudo apt-get update && sudo apt-get install libpng-dev libsdl2-dev libsdl2-mixer-dev zlib1g-dev
+    - name: "Configure"
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    - name: "Build"
+      run: cmake --build build --config RelWithDebInfo
+    - name: "Test"
+      run: cd build && ctest --build-config RelWithDebInfo
+    - name: "Create distribution artifact"
+      if: runner.os == 'Windows'
+      run: cmake --install build --config RelWithDebInfo --prefix "openc2e-${{ github.sha }}-${{ runner.os }}"
+    - name: "Create distribution artifact"
+      if: runner.os == 'Windows'
+      run: cmake --install build --config RelWithDebInfo --prefix "mngplayer2-${{ github.sha }}-${{ runner.os }}" --component mngplayer2
+    - name: "Upload distribution artifact"
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: openc2e-${{ github.sha }}-${{ runner.os }}
+        path: openc2e-${{ github.sha }}-${{ runner.os }}
+    - name: "Upload distribution artifact"
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: MNGPlayer2-${{ github.sha }}-${{ runner.os }}
+        path: mngplayer2-${{ github.sha }}-${{ runner.os }}

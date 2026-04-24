@@ -1,0 +1,10 @@
+build/
+out/
+.vs/
+.cache/
+
+# Misc debris
+.*.sw?
+*~
+.DS_Store
+build64/
